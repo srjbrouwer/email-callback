@@ -1,0 +1,405 @@
+import { useState, useEffect, useRef } from "react";
+
+// ─── CONFIG ── vul deze 3 waarden in ───────────────────────────────────────
+const CLIENT_ID    = "JOUW_CLIENT_ID";           // App Registration → Application (client) ID
+const TENANT_ID    = "JOUW_TENANT_ID";           // Azure AD → Tenant ID  (of "common" voor multitenant)
+const REDIRECT_URI = "https://JOUW_GITHUB_PAGES_URL/index.html"; // Waar je de callback pagina host
+// ───────────────────────────────────────────────────────────────────────────
+
+const SCOPES = "Mail.ReadWrite Mail.Send offline_access";
+const GRAPH  = "https://graph.microsoft.com/v1.0";
+const AUTH_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`;
+const TOKEN_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`;
+
+const PC = {
+  urgent: { dot:"#ef4444", bg:"#fef2f2", border:"#fecaca" },
+  high:   { dot:"#f97316", bg:"#fff7ed", border:"#fed7aa" },
+  medium: { dot:"#eab308", bg:"#fefce8", border:"#fef08a" },
+  low:    { dot:"#9ca3af", bg:"#f9fafb", border:"#e5e7eb" },
+};
+const CC = { Finance:"#3b82f6", Security:"#ef4444", Personal:"#8b5cf6", Sales:"#10b981", Operations:"#f59e0b", Subscriptions:"#6366f1", Insurance:"#14b8a6", Other:"#64748b" };
+
+function categorize(subject="", sender="") {
+  const s = (subject+" "+sender).toLowerCase();
+  if (/lastpass|password|security|2fa/.test(s))                  return "Security";
+  if (/amex|betaling|factuur|invoice|payment|batch/.test(s))     return "Finance";
+  if (/tandarts|dokter|skinvision|ohra|polis|legitimatie/.test(s)) return "Personal";
+  if (/linkedin|lead/.test(s))                                   return "Sales";
+  if (/planning|geboekt|booked|amadeus|api/.test(s))             return "Operations";
+  if (/renewal|subscription|abonnement|3cx|transip|exclaimer/.test(s)) return "Subscriptions";
+  if (/verzeker|insurance/.test(s))                              return "Insurance";
+  return "Other";
+}
+
+function prioritize(e) {
+  const s = (e.subject+" "+(e.from?.emailAddress?.address||"")).toLowerCase();
+  if (/lastpass|password|overdue|niet betaald/.test(s)) return "urgent";
+  if (e.flag?.flagStatus==="flagged" && !e.isRead)      return "urgent";
+  if (e.flag?.flagStatus==="flagged")                   return "high";
+  if (!e.isRead)                                        return "medium";
+  return "low";
+}
+
+// Simple PKCE helpers
+function base64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+}
+async function pkce() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = base64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  return { verifier, challenge };
+}
+
+export default function App() {
+  const [token, setToken]         = useState(null);
+  const [user, setUser]           = useState(null);
+  const [emails, setEmails]       = useState([]);
+  const [loading, setLoading]     = useState(false);
+  const [authError, setAuthError] = useState(null);
+  const [done, setDone]           = useState([]);
+  const [filter, setFilter]       = useState("all");
+  const [selected, setSelected]   = useState(null);
+  const [notes, setNotes]         = useState("");
+  const [draft, setDraft]         = useState("");
+  const [tone, setTone]           = useState("professioneel");
+  const [replyStatus, setReplyStatus] = useState(null);
+  const [patchStatus, setPatchStatus] = useState({});
+  const [showDone, setShowDone]   = useState(false);
+  const pkceRef = useRef(null);
+  const stateRef = useRef(null);
+
+  // Listen for OAuth callback from popup
+  useEffect(() => {
+    function onMessage(evt) {
+      if (evt.data?.type === "OAUTH_CODE") {
+        exchangeCode(evt.data.code, evt.data.state);
+      }
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  async function login() {
+    setAuthError(null);
+    const { verifier, challenge } = await pkce();
+    pkceRef.current = verifier;
+    const state = base64url(crypto.getRandomValues(new Uint8Array(8)));
+    stateRef.current = state;
+
+    const params = new URLSearchParams({
+      client_id:             CLIENT_ID,
+      response_type:         "code",
+      redirect_uri:          REDIRECT_URI,
+      scope:                 SCOPES,
+      state,
+      code_challenge:        challenge,
+      code_challenge_method: "S256",
+      prompt:                "select_account",
+    });
+    const popup = window.open(`${AUTH_URL}?${params}`, "mslogin", "width=480,height=640,left=200,top=100");
+    if (!popup) setAuthError("Popup geblokkeerd — sta popups toe voor deze pagina.");
+  }
+
+  async function exchangeCode(code, returnedState) {
+    if (returnedState !== stateRef.current) {
+      setAuthError("State mismatch — mogelijk CSRF aanval. Probeer opnieuw.");
+      return;
+    }
+    try {
+      const body = new URLSearchParams({
+        client_id:     CLIENT_ID,
+        grant_type:    "authorization_code",
+        code,
+        redirect_uri:  REDIRECT_URI,
+        code_verifier: pkceRef.current,
+        scope:         SCOPES,
+      });
+      const res  = await fetch(TOKEN_URL, { method:"POST", body, headers:{"Content-Type":"application/x-www-form-urlencoded"} });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error_description || data.error);
+      setToken(data.access_token);
+      // Fetch user profile
+      const me = await graphGet("/me?$select=displayName,mail", data.access_token);
+      setUser(me);
+      loadEmails(data.access_token);
+    } catch(e) {
+      setAuthError("Inloggen mislukt: " + e.message);
+    }
+  }
+
+  async function graphGet(path, t=token) {
+    const res = await fetch(`${GRAPH}${path}`, { headers:{ Authorization:`Bearer ${t}`, "Content-Type":"application/json" } });
+    if (!res.ok) { const e=await res.json().catch(()=>{}); throw new Error(e?.error?.message||`Graph ${res.status}`); }
+    return res.json();
+  }
+
+  async function graphPatch(path, body) {
+    const res = await fetch(`${GRAPH}${path}`, { method:"PATCH", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body:JSON.stringify(body) });
+    if (!res.ok) { const e=await res.json().catch(()=>{}); throw new Error(e?.error?.message||`Graph ${res.status}`); }
+    return res.status===204 ? null : res.json();
+  }
+
+  async function graphPost(path, body) {
+    const res = await fetch(`${GRAPH}${path}`, { method:"POST", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body:JSON.stringify(body) });
+    if (!res.ok) { const e=await res.json().catch(()=>{}); throw new Error(e?.error?.message||`Graph ${res.status}`); }
+    return res.status===204 ? null : res.json();
+  }
+
+  async function loadEmails(t=token) {
+    setLoading(true);
+    try {
+      const fields = "id,subject,from,receivedDateTime,isRead,flag,webLink,importance";
+      const [flagged, unread] = await Promise.all([
+        graphGet(`/me/messages?$filter=flag/flagStatus eq 'flagged'&$top=40&$select=${fields}&$orderby=receivedDateTime desc`, t),
+        graphGet(`/me/mailFolders/inbox/messages?$filter=isRead eq false&$top=20&$select=${fields}&$orderby=receivedDateTime desc`, t),
+      ]);
+      const seen = new Set();
+      const merged = [...(flagged.value||[]), ...(unread.value||[])].filter(e => {
+        if (seen.has(e.id)) return false;
+        seen.add(e.id); return true;
+      }).map(e => ({
+        ...e,
+        sender:   e.from?.emailAddress?.name || e.from?.emailAddress?.address || "Onbekend",
+        email:    e.from?.emailAddress?.address || "",
+        date:     new Date(e.receivedDateTime).toLocaleDateString("nl-NL",{day:"numeric",month:"short"}),
+        category: categorize(e.subject, e.from?.emailAddress?.address),
+        priority: prioritize(e),
+        flagged:  e.flag?.flagStatus === "flagged",
+      }));
+      const order = {urgent:0,high:1,medium:2,low:3};
+      merged.sort((a,b) => order[a.priority]-order[b.priority]);
+      setEmails(merged);
+    } catch(e) {
+      setAuthError("Laden mislukt: "+e.message);
+    } finally { setLoading(false); }
+  }
+
+  async function markDone(email) {
+    setPatchStatus(s => ({...s, [email.id]:"patching"}));
+    try {
+      await graphPatch(`/me/messages/${email.id}`, { isRead:true, flag:{flagStatus:"notFlagged"} });
+      setPatchStatus(s => ({...s, [email.id]:"done"}));
+      setDone(d => [...d, email.id]);
+      if (selected?.id===email.id) { setSelected(null); setReplyStatus(null); }
+    } catch(e) {
+      setPatchStatus(s => ({...s, [email.id]:"error"}));
+      alert("Kon niet bijwerken: "+e.message);
+    }
+  }
+
+  async function sendReply() {
+    setReplyStatus("sending");
+    try {
+      await graphPost(`/me/messages/${selected.id}/reply`, { comment:draft });
+      await markDone(selected);
+      setReplyStatus("sent");
+    } catch(e) {
+      setReplyStatus("error");
+      alert("Versturen mislukt: "+e.message);
+    }
+  }
+
+  async function generateDraft() {
+    if (!notes.trim()) return;
+    setReplyStatus("drafting");
+    try {
+      const res  = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          model:"claude-sonnet-4-20250514", max_tokens:1000,
+          messages:[{ role:"user", content:
+            `Schrijf een e-mailreactie in het Nederlands. Gebruik ALTIJD de aaien-slaan-aaien structuur:
+1. Vriendelijke opening / bedanken voor de mail (aaien)
+2. Kern van het antwoord op basis van de notities (slaan)
+3. Afsluiting uitnodigend voor vragen, bijv. "Mocht u nog vragen of opmerkingen hebben, hoor ik het graag." (aaien)
+
+Toon: ${tone} | Afzender: ${selected.sender} | Onderwerp: ${selected.subject}
+Notities: ${notes}
+
+Geef ALLEEN de e-mailtekst. Begin direct met de aanhef.`
+          }]
+        })
+      });
+      const data = await res.json();
+      setDraft(data.content?.find(b=>b.type==="text")?.text||"");
+      setReplyStatus("ready");
+    } catch { setReplyStatus("error"); }
+  }
+
+  const Btn = ({label,onClick,color="#1e293b",textColor="white",disabled=false}) => (
+    <button onClick={onClick} disabled={disabled} style={{padding:"7px 14px",borderRadius:7,fontSize:13,fontWeight:600,border:"none",cursor:disabled?"default":"pointer",background:color,color:textColor,opacity:disabled?0.5:1}}>{label}</button>
+  );
+
+  // ── LOGIN SCREEN ──
+  if (!token) return (
+    <div style={{fontFamily:"system-ui",display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#f8fafc"}}>
+      <div style={{background:"white",borderRadius:16,padding:"40px 48px",textAlign:"center",boxShadow:"0 4px 24px rgba(0,0,0,0.08)",maxWidth:360}}>
+        <div style={{fontSize:48,marginBottom:12}}>📬</div>
+        <h2 style={{margin:"0 0 8px",color:"#1e293b",fontSize:22}}>Email Triage</h2>
+        <p style={{color:"#64748b",fontSize:14,margin:"0 0 24px"}}>Log in met je Microsoft account om je gevlagde en ongelezen e-mails te beheren.</p>
+        <button onClick={login} style={{width:"100%",padding:"11px 0",borderRadius:8,background:"#0078d4",color:"white",border:"none",fontSize:15,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+          <svg width="20" height="20" viewBox="0 0 21 21"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+          Inloggen met Microsoft
+        </button>
+        {authError && <p style={{color:"#ef4444",fontSize:13,marginTop:16}}>{authError}</p>}
+        <p style={{color:"#94a3b8",fontSize:11,marginTop:20}}>Inloggen via je eigen Microsoft account. Alleen jouw mailbox wordt gelezen.</p>
+      </div>
+    </div>
+  );
+
+  // ── LOADING ──
+  if (loading) return (
+    <div style={{fontFamily:"system-ui",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:12,color:"#64748b"}}>
+      <div style={{fontSize:32}}>📬</div>
+      <div style={{fontWeight:600}}>E-mails ophalen uit Outlook…</div>
+    </div>
+  );
+
+  const active     = emails.filter(e => !done.includes(e.id));
+  const doneEmails = emails.filter(e =>  done.includes(e.id));
+  const visible    = active.filter(e => {
+    if (filter==="unread")  return !e.isRead;
+    if (filter==="urgent")  return e.priority==="urgent";
+    if (filter==="flagged") return e.flagged;
+    if (!["all","unread","urgent","flagged"].includes(filter)) return e.category===filter;
+    return true;
+  });
+
+  const urgentCount  = active.filter(e=>e.priority==="urgent").length;
+  const unreadCount  = active.filter(e=>!e.isRead).length;
+  const flaggedCount = active.filter(e=>e.flagged).length;
+  const categories   = [...new Set(emails.map(e=>e.category))];
+
+  // ── DETAIL ──
+  if (selected) {
+    const pc = PC[selected.priority];
+    return (
+      <div style={{fontFamily:"system-ui",maxWidth:720,margin:"0 auto",padding:16,background:"#f8fafc",minHeight:"100vh"}}>
+        <button onClick={()=>{setSelected(null);setReplyStatus(null);}} style={{background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:13,marginBottom:12,fontWeight:600}}>← Terug</button>
+
+        <div style={{background:"white",borderRadius:12,border:`1px solid ${pc.border}`,padding:18,marginBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"flex-start"}}>
+            <div>
+              <div style={{fontSize:15,fontWeight:700,color:"#1e293b"}}>{selected.subject}</div>
+              <div style={{fontSize:13,color:"#64748b",marginTop:3}}>Van: <strong>{selected.sender}</strong> &lt;{selected.email}&gt; · {selected.date}</div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:5}}>
+              <div style={{padding:"3px 9px",borderRadius:6,fontSize:11,fontWeight:700,background:(CC[selected.category]||CC.Other)+"18",color:CC[selected.category]||CC.Other}}>{selected.category}</div>
+              <div style={{display:"flex",gap:4}}>
+                {selected.flagged   && <span style={{fontSize:11,background:"#fef2f2",color:"#ef4444",borderRadius:5,padding:"2px 6px",fontWeight:600}}>🚩 Gevlagd</span>}
+                {!selected.isRead   && <span style={{fontSize:11,background:"#eff6ff",color:"#3b82f6",borderRadius:5,padding:"2px 6px",fontWeight:600}}>● Ongelezen</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{marginTop:12,display:"flex",gap:8,flexWrap:"wrap"}}>
+            <Btn label={patchStatus[selected.id]==="patching"?"⏳ Bezig…":"✅ Afgehandeld – gelezen + vlag weg"} onClick={()=>markDone(selected)} color="#10b981" disabled={patchStatus[selected.id]==="patching"} />
+            <a href={selected.webLink} target="_blank" rel="noreferrer" style={{padding:"7px 14px",borderRadius:7,fontSize:13,fontWeight:600,background:"#0078d4",color:"white",textDecoration:"none"}}>📬 Open in Outlook</a>
+          </div>
+        </div>
+
+        <div style={{background:"white",borderRadius:12,border:"1px solid #e2e8f0",padding:16}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1e293b",marginBottom:12}}>✍️ Reageren aan {selected.sender}</div>
+          <label style={{fontSize:12,fontWeight:600,color:"#64748b",display:"block",marginBottom:5}}>Jouw notities (kern van het antwoord):</label>
+          <textarea value={notes} onChange={e=>{setNotes(e.target.value);if(replyStatus==="ready")setReplyStatus(null);}} rows={3}
+            placeholder="Bijv: betaling gedaan gisteren, zie bijlage…"
+            style={{width:"100%",padding:10,borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,lineHeight:1.5,color:"#1e293b",resize:"vertical",fontFamily:"system-ui",boxSizing:"border-box"}} />
+          <div style={{display:"flex",gap:8,alignItems:"center",margin:"10px 0 14px",flexWrap:"wrap"}}>
+            <span style={{fontSize:12,fontWeight:600,color:"#64748b"}}>Toon:</span>
+            {["professioneel","vriendelijk","formeel"].map(t=>(
+              <button key={t} onClick={()=>setTone(t)} style={{padding:"5px 11px",borderRadius:20,fontSize:12,fontWeight:600,border:tone===t?"none":"1px solid #e2e8f0",background:tone===t?"#6366f1":"white",color:tone===t?"white":"#475569",cursor:"pointer"}}>{t}</button>
+            ))}
+            <Btn label={replyStatus==="drafting"?"✨ Bezig…":"✨ Maak concept"} onClick={generateDraft} color="#6366f1" disabled={!notes.trim()||replyStatus==="drafting"} />
+          </div>
+          {(replyStatus==="ready"||replyStatus==="sending") && <>
+            <label style={{fontSize:12,fontWeight:600,color:"#64748b",display:"block",marginBottom:5}}>Concept (aanpasbaar):</label>
+            <textarea value={draft} onChange={e=>setDraft(e.target.value)} rows={9}
+              style={{width:"100%",padding:11,borderRadius:8,border:"1px solid #cbd5e1",fontSize:13,lineHeight:1.7,color:"#1e293b",resize:"vertical",fontFamily:"system-ui",boxSizing:"border-box"}} />
+            <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+              <Btn label={replyStatus==="sending"?"Versturen…":"Versturen →"} onClick={sendReply} disabled={replyStatus==="sending"} />
+              <Btn label="↺ Nieuw concept" onClick={generateDraft} color="#6366f1" disabled={!notes.trim()} />
+              <Btn label="Afgehandeld zonder reply" onClick={()=>markDone(selected)} color="#f1f5f9" textColor="#64748b" />
+            </div>
+          </>}
+          {replyStatus==="sent"  && <div style={{color:"#10b981",fontWeight:700,fontSize:13,marginTop:8}}>✅ Verstuurd en afgehandeld!</div>}
+          {replyStatus==="error" && <div style={{color:"#ef4444",fontSize:13,marginTop:8}}>Fout. Probeer opnieuw.</div>}
+        </div>
+      </div>
+    );
+  }
+
+  // ── LIST ──
+  return (
+    <div style={{fontFamily:"system-ui",maxWidth:720,margin:"0 auto",padding:16,background:"#f8fafc",minHeight:"100vh"}}>
+      <div style={{background:"#1e293b",borderRadius:12,padding:"14px 18px",marginBottom:14,color:"white",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:17,fontWeight:700}}>📬 Email Triage</div>
+          <div style={{fontSize:12,color:"#94a3b8",marginTop:1}}>{user?.displayName || user?.mail || "Ingelogd"} · Outlook</div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <div style={{background:"#ef4444",borderRadius:7,padding:"5px 11px",fontSize:12,fontWeight:700}}>🔴 {urgentCount}</div>
+          <div style={{background:"#334155",borderRadius:7,padding:"5px 11px",fontSize:12,fontWeight:700}}>🚩 {flaggedCount}</div>
+          <div style={{background:"#334155",borderRadius:7,padding:"5px 11px",fontSize:12,fontWeight:700}}>📧 {unreadCount}</div>
+          <button onClick={()=>loadEmails()} title="Verversen" style={{background:"#475569",border:"none",borderRadius:7,padding:"5px 10px",color:"white",cursor:"pointer",fontSize:14}}>↺</button>
+          <button onClick={()=>{setToken(null);setEmails([]);setUser(null);}} title="Uitloggen" style={{background:"#475569",border:"none",borderRadius:7,padding:"5px 10px",color:"white",cursor:"pointer",fontSize:12}}>Uitloggen</button>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:7,flexWrap:"wrap",marginBottom:12}}>
+        {["all","flagged","unread","urgent",...categories].map(f=>(
+          <button key={f} onClick={()=>setFilter(f)} style={{padding:"5px 12px",borderRadius:20,fontSize:12,fontWeight:600,border:filter===f?"none":"1px solid #e2e8f0",background:filter===f?"#1e293b":"white",color:filter===f?"white":"#475569",cursor:"pointer"}}>
+            {f==="all"?`Alles (${active.length})`:f==="flagged"?`Gevlagd (${flaggedCount})`:f==="unread"?`Ongelezen (${unreadCount})`:f==="urgent"?`Urgent (${urgentCount})`:f}
+          </button>
+        ))}
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {visible.length===0 && <div style={{textAlign:"center",padding:40,color:"#94a3b8",background:"white",borderRadius:12}}>✅ Alles afgehandeld in deze weergave!</div>}
+        {visible.map(email=>{
+          const pc=PC[email.priority], busy=patchStatus[email.id]==="patching";
+          return (
+            <div key={email.id} style={{background:"white",borderRadius:10,border:"1px solid #e2e8f0",padding:"11px 14px",display:"flex",alignItems:"center",gap:10}}
+              onMouseEnter={e=>e.currentTarget.style.boxShadow="0 2px 8px rgba(0,0,0,0.08)"}
+              onMouseLeave={e=>e.currentTarget.style.boxShadow="none"}>
+              <div onClick={()=>{setSelected(email);setNotes("");setDraft("");setReplyStatus(null);}} style={{display:"flex",alignItems:"center",gap:10,flex:1,minWidth:0,cursor:"pointer"}}>
+                <div style={{width:9,height:9,borderRadius:"50%",background:pc.dot,flexShrink:0}}/>
+                {!email.isRead && <div style={{width:6,height:6,borderRadius:"50%",background:"#3b82f6",flexShrink:0,marginLeft:-5}}/>}
+                {email.flagged  && <span style={{fontSize:12,flexShrink:0}}>🚩</span>}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
+                    <div style={{fontWeight:email.isRead?500:700,fontSize:14,color:"#1e293b",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{email.subject}</div>
+                    <div style={{fontSize:11,color:"#94a3b8",flexShrink:0}}>{email.date}</div>
+                  </div>
+                  <div style={{fontSize:12,color:"#64748b",marginTop:1}}>{email.sender}</div>
+                </div>
+                <div style={{padding:"3px 8px",borderRadius:5,fontSize:11,fontWeight:600,background:(CC[email.category]||CC.Other)+"18",color:CC[email.category]||CC.Other,flexShrink:0}}>{email.category}</div>
+              </div>
+              <button onClick={()=>markDone(email)} disabled={busy} title="Afgehandeld" style={{flexShrink:0,background:busy?"#f1f5f9":"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:7,padding:"5px 9px",cursor:busy?"default":"pointer",fontSize:14}}>
+                {busy?"⏳":"✅"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {doneEmails.length>0 && (
+        <div style={{marginTop:20}}>
+          <button onClick={()=>setShowDone(v=>!v)} style={{background:"none",border:"none",color:"#94a3b8",cursor:"pointer",fontSize:13,fontWeight:600}}>
+            {showDone?"▲":"▼"} Afgehandeld ({doneEmails.length})
+          </button>
+          {showDone && <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:8}}>
+            {doneEmails.map(e=>(
+              <div key={e.id} style={{background:"#f1f5f9",borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",gap:10,opacity:0.65}}>
+                <span>✅</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,color:"#475569",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{e.subject}</div>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>{e.sender}</div>
+                </div>
+              </div>
+            ))}
+          </div>}
+        </div>
+      )}
+    </div>
+  );
+}
